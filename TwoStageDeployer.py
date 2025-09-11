@@ -7,22 +7,28 @@ class TwoStageDeployer:
     def __init__(self,
                  primary_model_path,
                  secondary_model_path,
+                 cattle_model_path,
                  conf_secondary=0.25,
                  conf_udder=0.4,
                  conf_hoof=0.25,
+                 conf_cattle = 0.8,
                  max_udder=1,
                  max_hoof=6,
                  max_nipple=4,
+                 max_cattle=1,
                  roi_expand=0.3,
                  device = 'cuda:0'):
         self.model_primary = YOLO(primary_model_path).to(device)
         self.model_secondary = YOLO(secondary_model_path).to(device)
+        self.model_cattle = YOLO(cattle_model_path).to(device)
         self.conf_secondary = conf_secondary
         self.conf_udder = conf_udder
         self.conf_hoof = conf_hoof
+        self.conf_cattle = conf_cattle
         self.max_udder = max_udder
         self.max_hoof = max_hoof
         self.max_nipple = max_nipple
+        self.max_cattle = max_cattle
         self.roi_expand = roi_expand
         self.device = device
         self.class_names = {0:"udder",1:"hoof",2:"nipple"}
@@ -72,7 +78,6 @@ class TwoStageDeployer:
             x1,y1,x2,y2 = map(int, bbox[:4])
             return img[y1:y2,x1:x2],(x1,y1)
 
-
     def filter_by_max_count(self,boxes,max_count,cls_name):
         """按置信度排序，保留前max_count个目标，过滤多余检测"""
         if len(boxes)<=max_count:
@@ -116,6 +121,159 @@ class TwoStageDeployer:
             cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
             cv2.putText(img, f"nipple({conf:.2f})", (int(x1), int(y1) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+    # 检测牛整体
+    def full_detect(self,img):
+        """
+        检测牛整体
+        :param img: 接收图像
+        :return: {接收的图像，牛整体检测框}
+        """
+        result_cattle = self.model_cattle(
+            img,conf = self.conf_cattle,device = self.device,verbose=False
+        )[0]
+
+        cattle_boxes = []
+        for box in result_cattle.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            bbox = box.xyxy.cpu().numpy().tolist()[0]
+            cattle_boxes.append(bbox+[conf,cls_id])
+        return {
+            "annotated_image":img,
+            "cattle_boxes":cattle_boxes
+        }
+
+    # 检测牛部位
+    def part_detect(self,img):
+        """
+        检测牛部位
+        :param img: 接收图像
+        :return {接收的图像，牛乳房检测框，牛肢蹄检测框，牛乳头检测框}
+        """
+        result_primary = self.model_primary(
+            img,conf = 0.1,device = self.device,verbose=False
+        )[0]
+
+        udder_boxes = []
+        hoof_boxes = []
+        for box in result_primary.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            bbox = box.xyxy[0].cpu().numpy().tolist()
+            if cls_id ==0 and conf>=self.conf_udder:
+                udder_boxes.append(bbox+[conf,cls_id])
+            elif cls_id ==1 and conf>=self.conf_hoof:
+                hoof_boxes.append(bbox+[conf,cls_id])
+
+        udder_boxes = self.filter_by_max_count(udder_boxes,self.max_udder,"udder")
+        hoof_boxes = self.filter_by_max_count(hoof_boxes,self.max_hoof,"hoof")
+
+        nipple_boxes = []
+        for udder in udder_boxes:
+            udder_bbox = udder[:4]
+            roi,(x_offset,y_offset) = self.expand_roi(img,udder_bbox)
+            results_secondary = self.model_secondary(
+                roi,conf = self.conf_secondary,device = self.device,verbose=False
+            )[0]
+
+            for box in results_secondary.boxes:
+                x1,y1,x2,y2= box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0])
+                nipple_boxes.append([
+                    x1+x_offset , y1+y_offset,
+                    x2+x_offset , y2+y_offset,
+                    conf,2
+                ])
+
+        nipple_boxes = self.filter_by_max_count(nipple_boxes,self.max_nipple,"nipple")
+
+        return {
+            "annotated_image":img,
+            "udder_boxes":udder_boxes,
+            "hoof_boxes":hoof_boxes,
+            "nipple_boxes":nipple_boxes
+        }
+
+    # 处理牛整体
+    def full_process(self,full_detect_result):
+        """
+        标注牛整体检测框（紫色）
+        :param full_detect_result: 接收牛整体检测结果
+        :return 带上检测框后的图像
+        """
+        img_copy = full_detect_result["annotated_image"]
+        for bbox in full_detect_result["cattle_boxes"]:
+            x1,y1,x2,y2,conf,cls_id = bbox
+            cv2.rectangle(img_copy,(int(x1),int(y1)),(int(x2),int(y2)),(128,0,128),2)
+            cv2.putText(img_copy,f"cattle({conf:.2f})",(int(x1),int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128,0,128), 2)
+
+        return img_copy
+
+    # 处理牛部位
+    def part_process(self,img,part_detect_result):
+        """
+        标注牛部位检测框
+        :param img 接收的图像
+        :param part_detect_result 牛部位检测结果
+        :return 带上检测框后的图像
+        """
+        img_copy = img.copy()
+
+        # 乳房（绿色）
+        for bbox in part_detect_result["udder_boxes"]:
+            x1 ,y1,x2,y2,conf,cls_id = bbox
+            cv2.rectangle(img_copy,(int(x1),int(y1)),(int(x2),int(y2)),(0,255,0),2)
+            cv2.putText(img_copy,f"udder({conf:.2f})",(int(x1),int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+        # 肢蹄（蓝色）
+        for bbox in part_detect_result["hoof_boxes"]:
+            x1 ,y1,x2,y2,conf,cls_id = bbox
+            cv2.rectangle(img_copy,(int(x1),int(y1)),(int(x2),int(y2)),(255,0,0),2)
+            cv2.putText(img_copy,f"hoof({conf:.2f})",(int(x1),int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,0,0), 2)
+
+        # 乳头（红色）
+        for bbox in part_detect_result["nipple_boxes"]:
+            x1,y1,x2,y2,conf,cls_id = bbox
+            cv2.rectangle(img_copy,(int(x1),int(y1)),(int(x2),int(y2)),(0,0,255),2)
+            cv2.putText(img_copy,f"nipple({conf:.2f})",(int(x1),int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+
+        return img_copy
+
+    # 整合全部处理，返回带检测框的图片
+    def _process_image(self,image_path):
+        """
+        总处理
+        :param image_path: 图像路径
+        :return 处理后的图像
+        """
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"Not found {image_path}")
+        img_copy = img.copy()
+
+        full_detect_result = self.full_detect(img)  # 检测牛整体
+        part_detect_result = self.part_detect(img)  # 检测牛部位
+        img_copy = self.full_process(full_detect_result)    # 处理牛整体
+        img_copy = self.part_process(img_copy,part_detect_result)   # 处理牛部位
+
+        # 保存结果
+        save_path = os.path.join(self.output_dir,os.path.basename(image_path))
+        cv2.imwrite(save_path,img_copy)
+        print(f"save {save_path}")
+
+        return img_copy
+
+
+
+
+
+
+
 
     def process_rgb_images(self,rgb_images):
         """直接处理内存中的RGB图像（cv2格式），返回检测框"""
@@ -292,6 +450,7 @@ if __name__ == "__main__":
         # 微调后的乳房肢蹄模型
         secondary_model_path=r"D:\yolov8-main\ultralytics\runs\detect\train_nipple_finetune\weights\best.pt",
         # 微调后的乳头模型
+        cattle_model_path=r"D:\yolov8-main\ultralytics\runs\detect\train_cattle\weights\best.pt",
         conf_udder=0.4,  # 乳房阈值：0.4（无假阳性，符合其100%精确率）
         conf_hoof=0.5,  # 肢蹄阈值：0.25（漏检率低，符合其95.3%召回率）
         conf_secondary=0.3,  # 乳头阈值：0.3（减少误检）
@@ -300,4 +459,6 @@ if __name__ == "__main__":
         max_nipple=4,
         device='cuda:0'
     )
-    deployer.process_image(r"D:\yolov8-main\datasets\Resources\cattle_images\images\train\15097S.JPG")
+    # deployer._process_image(r"D:\yolov8-main\datasets\Resources\cattle_images\images\train\15097S.JPG")
+    deployer._process_image(r"E:\Project Code\Python\YOD-PCP-KIADC\captured_data\color\0.jpg")
+    # deployer.process_image(r"D:\yolov8-main\datasets\Resources\cattle_images\images\train\15097S.JPG")

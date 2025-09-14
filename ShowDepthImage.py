@@ -17,5 +17,5 @@ def show_depth_image_matplotlib(depth_image_path):
     plt.show()
 
 if __name__ == '__main__':
-    depth_image_path = './captured_data/depth/0.npy'
+    depth_image_path = ''
     show_depth_image_matplotlib(depth_image_path)

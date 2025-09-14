@@ -122,6 +122,175 @@ class TwoStageDeployer:
             cv2.putText(img, f"nipple({conf:.2f})", (int(x1), int(y1) - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
 
+    def process_rgb_images(self,rgb_images):
+        """直接处理内存中的RGB图像（cv2格式），返回检测框"""
+        try:
+            rgb_copy = rgb_images.copy()
+            h,w = rgb_images.shape[:2]
+
+            # 第一阶段检测
+            try:
+                result_primary = self.model_primary(
+                    rgb_images,conf=0.1,device=self.device,verbose=False
+                )[0]
+            except Exception as e:
+                print(f"第一阶段模型推理失败：{str(e)}")
+                return {'annotated_image': rgb_copy, 'udder': [], 'hoof': [], 'nipple': []}
+
+            udder_boxes = []
+            hoof_boxes = []
+            for box in result_primary.boxes:
+                try:
+                    cls_id = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    bbox = box.xyxy[0].cpu().numpy().tolist()
+                    # 强制确保bbox是4个值（x1,y1,x2,y2）
+                    if len(bbox)!=4:
+                        print(f"警告：模型返回的检测框格式错误，预期4个值，实际{len(bbox)}个，跳过")
+                        continue
+
+                    # 组装6个值的检测框（x1,y1,x2,y2,conf,cls_id）
+                    if cls_id==0 and conf>=self.conf_udder:
+                        udder_boxes.append(bbox+[conf,cls_id])
+                    elif cls_id==1 and conf>=self.conf_hoof:
+                        hoof_boxes.append(bbox+[conf,cls_id])
+                except Exception as e:
+                    print(f"处理第一阶段检测框失败：{str(e)}")
+                    continue
+
+            # 应用数量约束
+            udder_boxes = self.filter_by_max_count(udder_boxes, self.max_udder, "udder")
+            hoof_boxes = self.filter_by_max_count(hoof_boxes, self.max_hoof, "hoof")
+
+            # 第二阶段乳头检测
+            nipple_boxes = []
+            for udder in udder_boxes:
+                try:
+                    if len(udder)<4:
+                        print(f"警告：乳房检测框格式错误，无法提取ROI，跳过乳头检测")
+                        continue
+                    udder_bbox = udder[:4]
+
+                    roi,offset = self.expand_roi(rgb_images,udder_bbox)
+                    if len(offset)!=2:
+                        print(f"偏移量解包失败，预期2个值，实际{len(offset)}个")
+                        continue
+                    x_offset,y_offset = offset
+
+                    # 乳头模型推理
+                    result_secondary = self.model_secondary(roi,conf=self.conf_secondary,device=self.device,verbose=False)[0]
+                    for box in result_secondary.boxes:
+                        x1,y1,x2,y2 = box.xyxy[0].cpu().numpy()
+                        conf = float(box.conf[0])
+                        # 组装6个值的乳头检测框
+                        nipple_boxes.append([x1+x_offset,y1+y_offset,x2+x_offset,y2+y_offset,conf,2])
+                except Exception as e:
+                    print(f"处理乳头检测失败：{str(e)}")
+                    continue
+
+            nipple_boxes = self.filter_by_max_count(nipple_boxes,self.max_nipple,"nipple")
+
+            # 绘制检测框
+            self.draw_boxes(rgb_copy,udder_boxes, hoof_boxes, nipple_boxes)
+
+            return {
+                "annotated_image": rgb_copy,
+                "udder": udder_boxes,
+                "hoof": hoof_boxes,
+                "nipple":nipple_boxes
+            }
+        except Exception as e:
+            print(f"推理失败: {str(e)}")
+            return {
+                'annotated_image': rgb_images,  # 返回原始图像
+                'udder': [],
+                'hoof': [],
+                'nipple': []
+            }
+
+    def process_image_old(self, img_path):
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"图像不存在: {img_path}")
+        img_copy = img.copy()
+
+        # 第一阶段：检测乳房和蹄部
+        results_primary = self.model_primary(
+            img, conf=0.1, device=self.device, verbose=False    # 基础阈值设0.1，避免提前过滤目标
+        )[0]
+
+        # 提取乳房和蹄部，带置信度
+        udder_boxes = []  # 格式：[x1,y1,x2,y2,conf,cls_id]
+        hoof_boxes = []
+        for box in results_primary.boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            bbox = box.xyxy[0].cpu().numpy().tolist()
+            # 乳房：用高阈值self.conf_udder过滤（如0.4）
+            if cls_id == 0 and conf >=self.conf_udder:
+                udder_boxes.append(bbox + [conf, cls_id])
+            elif cls_id == 1 and conf >=self.conf_hoof:
+                hoof_boxes.append(bbox + [conf, cls_id])
+
+        # 应用数量约束：过滤多余乳房和蹄部
+        udder_boxes = self.filter_by_max_count(udder_boxes, self.max_udder, "乳房")
+        hoof_boxes = self.filter_by_max_count(hoof_boxes, self.max_hoof, "蹄部")
+
+        # 第二阶段：乳头检测（仅在有效乳房区域内）
+        nipple_boxes = []
+        for udder in udder_boxes:
+            # 提取乳房边界框（前4个元素是x1,y1,x2,y2）
+            udder_bbox = udder[:4]
+            roi, (x_offset, y_offset) = self.expand_roi(img, udder_bbox)
+            results_secondary = self.model_secondary(
+                roi, conf=self.conf_secondary, device=self.device, verbose=False
+            )[0]
+            # 映射乳头坐标到原图，并记录置信度
+            for box in results_secondary.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0])
+                nipple_boxes.append([
+                    x1 + x_offset, y1 + y_offset,
+                    x2 + x_offset, y2 + y_offset,
+                    conf, 2  # cls_id=2
+                ])
+
+        # 应用数量约束：过滤多余乳头
+        nipple_boxes = self.filter_by_max_count(nipple_boxes, self.max_nipple, "乳头")
+
+        # 标注所有目标
+        # 1. 乳房（绿色）
+        for bbox in udder_boxes:
+            x1, y1, x2, y2, conf, cls_id = bbox
+            cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+            cv2.putText(img_copy, f"udder({conf:.2f})", (int(x1), int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+        # 2. 蹄部（蓝色）
+        for bbox in hoof_boxes:
+            x1, y1, x2, y2, conf, cls_id = bbox
+            cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
+            cv2.putText(img_copy, f"hoof({conf:.2f})", (int(x1), int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        # 3. 乳头（红色）
+        for bbox in nipple_boxes:
+            x1, y1, x2, y2, conf, cls_id = bbox
+            cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+            cv2.putText(img_copy, f"nipple({conf:.2f})", (int(x1), int(y1) - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        # 保存结果
+        save_path = os.path.join(self.output_dir, os.path.basename(img_path))
+        cv2.imwrite(save_path, img_copy)
+        print(f"结果保存至: {save_path}")
+
+        return {
+            "udder": udder_boxes,
+            "hoof": hoof_boxes,
+            "nipple": nipple_boxes
+        }
+
     # 检测牛整体
     def full_detect(self,img):
         """
@@ -245,7 +414,7 @@ class TwoStageDeployer:
         return img_copy
 
     # 整合全部处理，返回带检测框的图片
-    def _process_image(self,image_path):
+    def process_image(self,image_path):
         """
         总处理
         :param image_path: 图像路径
@@ -268,182 +437,6 @@ class TwoStageDeployer:
 
         return img_copy
 
-
-
-
-
-
-
-
-    def process_rgb_images(self,rgb_images):
-        """直接处理内存中的RGB图像（cv2格式），返回检测框"""
-        try:
-            rgb_copy = rgb_images.copy()
-            h,w = rgb_images.shape[:2]
-
-            # 第一阶段检测
-            try:
-                result_primary = self.model_primary(
-                    rgb_images,conf=0.1,device=self.device,verbose=False
-                )[0]
-            except Exception as e:
-                print(f"第一阶段模型推理失败：{str(e)}")
-                return {'annotated_image': rgb_copy, 'udder': [], 'hoof': [], 'nipple': []}
-
-            udder_boxes = []
-            hoof_boxes = []
-            for box in result_primary.boxes:
-                try:
-                    cls_id = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    bbox = box.xyxy[0].cpu().numpy().tolist()
-                    # 强制确保bbox是4个值（x1,y1,x2,y2）
-                    if len(bbox)!=4:
-                        print(f"警告：模型返回的检测框格式错误，预期4个值，实际{len(bbox)}个，跳过")
-                        continue
-
-                    # 组装6个值的检测框（x1,y1,x2,y2,conf,cls_id）
-                    if cls_id==0 and conf>=self.conf_udder:
-                        udder_boxes.append(bbox+[conf,cls_id])
-                    elif cls_id==1 and conf>=self.conf_hoof:
-                        hoof_boxes.append(bbox+[conf,cls_id])
-                except Exception as e:
-                    print(f"处理第一阶段检测框失败：{str(e)}")
-                    continue
-
-            # 应用数量约束
-            udder_boxes = self.filter_by_max_count(udder_boxes, self.max_udder, "udder")
-            hoof_boxes = self.filter_by_max_count(hoof_boxes, self.max_hoof, "hoof")
-
-            # 第二阶段乳头检测
-            nipple_boxes = []
-            for udder in udder_boxes:
-                try:
-                    if len(udder)<4:
-                        print(f"警告：乳房检测框格式错误，无法提取ROI，跳过乳头检测")
-                        continue
-                    udder_bbox = udder[:4]
-
-                    roi,offset = self.expand_roi(rgb_images,udder_bbox)
-                    if len(offset)!=2:
-                        print(f"偏移量解包失败，预期2个值，实际{len(offset)}个")
-                        continue
-                    x_offset,y_offset = offset
-
-                    # 乳头模型推理
-                    result_secondary = self.model_secondary(roi,conf=self.conf_secondary,device=self.device,verbose=False)[0]
-                    for box in result_secondary.boxes:
-                        x1,y1,x2,y2 = box.xyxy[0].cpu().numpy()
-                        conf = float(box.conf[0])
-                        # 组装6个值的乳头检测框
-                        nipple_boxes.append([x1+x_offset,y1+y_offset,x2+x_offset,y2+y_offset,conf,2])
-                except Exception as e:
-                    print(f"处理乳头检测失败：{str(e)}")
-                    continue
-
-            nipple_boxes = self.filter_by_max_count(nipple_boxes,self.max_nipple,"nipple")
-
-            # 绘制检测框
-            self.draw_boxes(rgb_copy,udder_boxes, hoof_boxes, nipple_boxes)
-
-            return {
-                "annotated_image": rgb_copy,
-                "udder": udder_boxes,
-                "hoof": hoof_boxes,
-                "nipple":nipple_boxes
-            }
-        except Exception as e:
-            print(f"推理失败: {str(e)}")
-            return {
-                'annotated_image': rgb_images,  # 返回原始图像
-                'udder': [],
-                'hoof': [],
-                'nipple': []
-            }
-
-    def process_image(self, img_path):
-        img = cv2.imread(img_path)
-        if img is None:
-            raise FileNotFoundError(f"图像不存在: {img_path}")
-        img_copy = img.copy()
-
-        # 第一阶段：检测乳房和蹄部
-        results_primary = self.model_primary(
-            img, conf=0.1, device=self.device, verbose=False    # 基础阈值设0.1，避免提前过滤目标
-        )[0]
-
-        # 提取乳房和蹄部，带置信度
-        udder_boxes = []  # 格式：[x1,y1,x2,y2,conf,cls_id]
-        hoof_boxes = []
-        for box in results_primary.boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            bbox = box.xyxy[0].cpu().numpy().tolist()
-            # 乳房：用高阈值self.conf_udder过滤（如0.4）
-            if cls_id == 0 and conf >=self.conf_udder:
-                udder_boxes.append(bbox + [conf, cls_id])
-            elif cls_id == 1 and conf >=self.conf_hoof:
-                hoof_boxes.append(bbox + [conf, cls_id])
-
-        # 应用数量约束：过滤多余乳房和蹄部
-        udder_boxes = self.filter_by_max_count(udder_boxes, self.max_udder, "乳房")
-        hoof_boxes = self.filter_by_max_count(hoof_boxes, self.max_hoof, "蹄部")
-
-        # 第二阶段：乳头检测（仅在有效乳房区域内）
-        nipple_boxes = []
-        for udder in udder_boxes:
-            # 提取乳房边界框（前4个元素是x1,y1,x2,y2）
-            udder_bbox = udder[:4]
-            roi, (x_offset, y_offset) = self.expand_roi(img, udder_bbox)
-            results_secondary = self.model_secondary(
-                roi, conf=self.conf_secondary, device=self.device, verbose=False
-            )[0]
-            # 映射乳头坐标到原图，并记录置信度
-            for box in results_secondary.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = float(box.conf[0])
-                nipple_boxes.append([
-                    x1 + x_offset, y1 + y_offset,
-                    x2 + x_offset, y2 + y_offset,
-                    conf, 2  # cls_id=2
-                ])
-
-        # 应用数量约束：过滤多余乳头
-        nipple_boxes = self.filter_by_max_count(nipple_boxes, self.max_nipple, "乳头")
-
-        # 标注所有目标
-        # 1. 乳房（绿色）
-        for bbox in udder_boxes:
-            x1, y1, x2, y2, conf, cls_id = bbox
-            cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(img_copy, f"udder({conf:.2f})", (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-        # 2. 蹄部（蓝色）
-        for bbox in hoof_boxes:
-            x1, y1, x2, y2, conf, cls_id = bbox
-            cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (255, 0, 0), 2)
-            cv2.putText(img_copy, f"hoof({conf:.2f})", (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
-
-        # 3. 乳头（红色）
-        for bbox in nipple_boxes:
-            x1, y1, x2, y2, conf, cls_id = bbox
-            cv2.rectangle(img_copy, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
-            cv2.putText(img_copy, f"nipple({conf:.2f})", (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        # 保存结果
-        save_path = os.path.join(self.output_dir, os.path.basename(img_path))
-        cv2.imwrite(save_path, img_copy)
-        print(f"结果保存至: {save_path}")
-
-        return {
-            "udder": udder_boxes,
-            "hoof": hoof_boxes,
-            "nipple": nipple_boxes
-        }
-
 if __name__ == "__main__":
     deployer = TwoStageDeployer(
         primary_model_path=r"D:\yolov8-main\ultralytics\runs\detect\train_hoof_hard_finetune\weights\best.pt",
@@ -459,6 +452,6 @@ if __name__ == "__main__":
         max_nipple=4,
         device='cuda:0'
     )
-    # deployer._process_image(r"D:\yolov8-main\datasets\Resources\cattle_images\images\train\15097S.JPG")
-    deployer._process_image(r"E:\Project Code\Python\YOD-PCP-KIADC\captured_data\color\0.jpg")
     # deployer.process_image(r"D:\yolov8-main\datasets\Resources\cattle_images\images\train\15097S.JPG")
+    deployer.process_image(r"E:\Project Code\Python\YOD-PCP-KIADC\captured_data\color\0.jpg")
+    # deployer.process_image_old(r"D:\yolov8-main\datasets\Resources\cattle_images\images\train\15097S.JPG")

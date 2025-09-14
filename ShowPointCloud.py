@@ -10,5 +10,5 @@ def show_depth_image_matplotlib(pointcloud_path):
     o3d.visualization.draw_geometries([pcd],window_name="ShowCloudPoint")
 
 if __name__ == '__main__':
-    pointcloud_path = './captured_data/pointcloud/0.npy'
+    pointcloud_path = ''
     show_depth_image_matplotlib(pointcloud_path)
